@@ -5,8 +5,11 @@ import json
 import re
 import sys
 import gzip
+import ipaddress
+
 import pandas as pd
 import numpy as np
+from SubnetTree import SubnetTree
 
 
 class ASInfo:
@@ -43,6 +46,12 @@ class ASInfo:
         self.as_to_org_df = None
         self.peeringdb_net_df = None
         
+        # This variable caches merged df using all dfs above
+        self.all_df = None
+        
+        # Initialize SubnetTree for IP lookup
+        self.subnet_tree = None
+        
         # Build the base dfs based on the datasets above.
         self.__build()
     
@@ -70,7 +79,10 @@ class ASInfo:
         if merge_all or ('asn_ip_count' in kwargs and kwargs['asn_ip_count'] == True):
             result = self.__merge_asn_ip_count(result)
         
-        return result.fillna("N/A")
+        if merge_all:
+            self.all_df = result
+            
+        return result.fillna("")
     
     def get_upstream_ases_by_asn(self, asn):
         df = self.as_relationship_df
@@ -87,11 +99,24 @@ class ASInfo:
             ['as0', 'as1', 'relation', 'asn_name', 'source', 'org_name', 'country']
         ]
         return downstream_ases
+    
+    def get_as_info_by_ip(self, ip:str):
+        if self.all_df is None:
+            self.merge(all=True)
+        result = None
+        try:
+            ip = str(ipaddress.ip_address(ip))
+            result = self.all_df[self.all_df.asn == self.subnet_tree[ip]]
+        except ValueError:
+            print("Input IP: {} is not valid".format(address))
+        return result
 
     def __build(self):
         self.as_relationship_df = self.__build_as_relationship()
         self.as_basic_df = self.__build_as_basic()
         self.prefix_to_asn_df = self.__build_prefix_to_asn()
+        # can only build the subnet_tree after __build_prefix_to_asn()
+        self.subnet_tree = self.__build_subnet_tree()
         self.as_to_org_df = self.__build_as_to_org()
         self.peeringdb_net_df = self.__build_peeringdb_net()
     
@@ -174,7 +199,13 @@ class ASInfo:
                 else:
                     print ("unknown type",keys[0],file= sys.stderr)
         return asn_info
-
+    
+    def __build_subnet_tree(self):
+        t = SubnetTree()
+        for e in self.prefix_to_asn_df.values.tolist():
+            t[e[0] + "/" + str(e[1])] = e[2]
+        return t
+    
     def __build_prefix_to_asn(self):
         # Note that the original dataset format in gzip format.
         # We first load the dataset as a df
@@ -184,10 +215,11 @@ class ASInfo:
         # Build filters to find rows with moas and as_set
         prefix2as_asn_filter_moas = prefix2as_df['asn'].str.contains("_")
         prefix2as_asn_filter_as_set = prefix2as_df['asn'].str.contains(",")
-        # remove moas and as_set from the prefix2as_df
+
+        # Remove moas and as_set from the prefix2as_df
         prefix2as_df = prefix2as_df[(~prefix2as_asn_filter_moas) & (~prefix2as_asn_filter_as_set)]
         prefix2as_df = prefix2as_df.astype({'asn': 'int64'})
-
+        
         return prefix2as_df
 
     def __build_as_relationship(self):
