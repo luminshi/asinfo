@@ -6,6 +6,8 @@ import re
 import sys
 import gzip
 import ipaddress
+from functools import lru_cache
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
@@ -79,11 +81,15 @@ class ASInfo:
         if merge_all or ('asn_ip_count' in kwargs and kwargs['asn_ip_count'] == True):
             result = self.__merge_asn_ip_count(result)
         
+        # fill NaA fields with empty string
+        result = result.fillna("")
+
         if merge_all:
             self.all_df = result
             
-        return result.fillna("")
+        return result
     
+    @lru_cache(maxsize=2048)
     def get_upstream_ases_by_asn(self, asn):
         df = self.as_relationship_df
         upstream_ases = df[(df['relation'] == -1) & (df['as1'] == asn)]
@@ -92,6 +98,7 @@ class ASInfo:
         ]
         return upstream_ases
     
+    @lru_cache(maxsize=2048)
     def get_customer_ases_by_asn(self, asn):
         df = self.as_relationship_df
         downstream_ases = df[(df['relation'] == -1) & (df['as0'] == asn)]
@@ -100,16 +107,49 @@ class ASInfo:
         ]
         return downstream_ases
     
+    @lru_cache(maxsize=2048)
     def get_as_info_by_ip(self, ip:str):
         if self.all_df is None:
             self.merge(all=True)
         result = None
         try:
-            ip = str(ipaddress.ip_address(ip))
-            result = self.all_df[self.all_df.asn == self.subnet_tree[ip]]
+            ip_obj = ipaddress.ip_address(ip)
+            result = self.all_df[ self.all_df.asn.isin(self.subnet_tree[str(ip_obj)]) ]
         except ValueError:
-            print("Input IP: {} is not valid".format(address))
+            print("Input IP: {} is not valid".format(ip))
         return result
+
+    @lru_cache(maxsize=2048)
+    def get_as_info_by_prefix(self, prefix:str):
+        if self.all_df is None:
+            self.merge(all=True)
+        result = None
+        try:
+            prefix_obj = ipaddress.ip_network(prefix)
+            # why iter is necessary here? if the prefix is a /32, the hosts() return a LIST instead of a GENERATOR!.
+            ip_obj = next(iter(prefix_obj.hosts()))
+            result = self.all_df[ self.all_df.asn.isin(self.subnet_tree[str(ip_obj)]) ]
+        except ValueError:
+            print("Input prefix: {} is not valid".format(prefix))
+        except TypeError:
+            print(f"the problematic prefix: {prefix_obj}")
+        return result
+    
+    @lru_cache(maxsize=2048)
+    def get_as_info_by_asn(self, asn:int):
+        if self.all_df is None:
+            self.merge(all=True)
+        return self.all_df[ self.all_df.asn == asn ]
+    
+    @lru_cache(maxsize=2048)
+    def get_prefix_by_asn(self, asn:int):
+        return self.prefix_to_asn_df[self.prefix_to_asn_df.asn.map(lambda x: asn in x)]
+    
+    @lru_cache(maxsize=2048)
+    def get_as_info_by_org_name(self, name:str):
+        if self.all_df is None:
+            self.merge(all=True)
+        return self.all_df[ self.all_df.org_name.str.contains(name, case=False) ]
 
     def __build(self):
         self.as_relationship_df = self.__build_as_relationship()
@@ -126,22 +166,57 @@ class ASInfo:
                 on='asn', how="inner")
 
     def __merge_peeringdb_net(self, df_to_merge_with):
-        return df_to_merge_with.merge(
-                self.peeringdb_net_df[
-                    ['asn', 'website', 'info_type', 'info_traffic', 'info_ratio', 'info_scope']
-                ],
+        result = df_to_merge_with.merge(
+                self.peeringdb_net_df[['asn', 'website',
+                                       'info_type', 'info_traffic',
+                                       'info_ratio', 'info_scope']],
                 on='asn', how="left")
+        
+        # get ASes with traffic information
+        ases_with_traffic_level_info = result[result['info_traffic'].str.len() > 1]
+        # extract the traffic information with regex
+        ases_with_traffic_level_info = ases_with_traffic_level_info['info_traffic'].str.extract(r'(\d+)-(\d+)([a-zA-Z]+)').rename(columns={0:"bw_low", 1:"bw_high", 2:"bw_factor"}).dropna()
 
+        # Use Mbps as the base unit
+        def get_bw_factor(unit):
+            unit = unit.lower()
+            if unit == "tbps":
+                return 1000000
+            elif unit == "gbps":
+                return 1000
+            elif unit == "mbps":
+                return 1
+            else:
+                raise Exception(f"B.W. unit: {unit} is not handled")
+        
+        ases_with_traffic_level_info['bw_factor'] = ases_with_traffic_level_info['bw_factor'].apply(get_bw_factor)
+        # convert data type
+        ases_with_traffic_level_info = ases_with_traffic_level_info.astype({'bw_low': 'int', 'bw_high': 'int', 'bw_factor': 'int'})
+        ases_with_traffic_level_info['bw_low_mbps'] = ases_with_traffic_level_info['bw_low'] * ases_with_traffic_level_info['bw_factor']
+        ases_with_traffic_level_info['bw_high_mbps'] = ases_with_traffic_level_info['bw_high'] * ases_with_traffic_level_info['bw_factor']
+        result['bw_low_mbps'] = ases_with_traffic_level_info['bw_low_mbps']
+        result['bw_high_mbps'] = ases_with_traffic_level_info['bw_high_mbps']
+        
+        # we can now drop the info_traffic column
+        result.drop(columns=['info_traffic'])
+        
+        return result
+    
     def __merge_asn_ip_count(self, df_to_merge_with):
-        # final_stage (stub/tier-3 networks dataframe) inner joined with prefix2as_df
-        tmp_df = df_to_merge_with.merge(self.prefix_to_asn_df, how='inner', on='asn')
-        # calculate the number of IPs of each prefix
-        asn_to_num_ips_df = tmp_df.assign(
-                num_ips = 2 ** (32 - tmp_df['prefix_len'])
-                ).groupby('asn')['num_ips'].sum()
-        # replace NAs with 0s
+        # build a df that maps num_ips to asn
+        asn_to_ip_num = defaultdict(int)
+        for record in self.prefix_to_asn_df.to_records(index=False):
+            asn_list = record[2]
+            # every asn gets some dup. ip nums!
+            for asn in asn_list:
+                # all prefixes should be in IPv4
+                asn_to_ip_num[int(asn)] += 2 ** (32 - record[1])
+        t = pd.DataFrame(asn_to_ip_num.items(), columns = ['asn', 'num_ips'])
+        t = t.astype({'asn':'int64'})
+        t = t.sort_values(by=['asn']).reset_index().drop(columns=['index'])
+
         # merge with the input df
-        merged_df = df_to_merge_with.merge(asn_to_num_ips_df, on='asn', how='left')
+        merged_df = df_to_merge_with.merge(t, on='asn', how='left')
         # make sure the number of ips column is int type
         merged_df['num_ips'] = merged_df['num_ips'].fillna(0)
         merged_df = merged_df.astype({'num_ips':'int64'})
@@ -212,14 +287,20 @@ class ASInfo:
         prefix2as_df = pd.read_csv(self.prefix_to_asn, names=['prefix', 'prefix_len', 'asn'],
                            delim_whitespace=True, header=None, compression="gzip")
 
-        # Build filters to find rows with moas and as_set
-        prefix2as_asn_filter_moas = prefix2as_df['asn'].str.contains("_")
-        prefix2as_asn_filter_as_set = prefix2as_df['asn'].str.contains(",")
+        # Build filters to find rows with MOAS and as_set
+        # A MOAS conflict occurs when a particular prefix appears to originate from more than one AS. 
+        #prefix2as_asn_filter_moas = prefix2as_df['asn'].str.contains("_")
+        # Let's ignore AS set records for now; they are rare events.
+        #prefix2as_asn_filter_as_set = prefix2as_df['asn'].str.contains(",")
 
-        # Remove moas and as_set from the prefix2as_df
-        prefix2as_df = prefix2as_df[(~prefix2as_asn_filter_moas) & (~prefix2as_asn_filter_as_set)]
-        prefix2as_df = prefix2as_df.astype({'asn': 'int64'})
-        
+        # Remove as_set from the prefix2as_df
+        prefix2as_df = prefix2as_df[~prefix2as_df['asn'].str.contains(",")]
+        prefix2as_df_copy = prefix2as_df.copy()
+        # split MOAS ASNs into a list
+        prefix2as_df_copy['asn'] = prefix2as_df.asn.str.split("_")
+        prefix2as_df = prefix2as_df_copy
+        prefix2as_df.asn = prefix2as_df.asn.apply(lambda x: [int(asn) for asn in x])
+                
         return prefix2as_df
 
     def __build_as_relationship(self):
