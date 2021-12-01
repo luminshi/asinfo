@@ -34,7 +34,7 @@ class ASInfo:
         self.prefix_to_asn = self.DATASET_PATH + "/caida/" + "routeviews-rv2-20211018-1200.pfx2as.gz"
         
         # The AS to Organization (CAIDA) dataset path
-        self.asn_to_org = self.DATASET_PATH + "/caida/" + "20211001.as-org2info.txt.gz"
+        self.asn_to_org = self.DATASET_PATH + "/caida/" + "20211001.as-org2info.jsonl.gz"
 
         # The PeeringDB nets dataset path
         # How to download the entire peeringdb dump:
@@ -89,7 +89,7 @@ class ASInfo:
             
         return result
     
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_upstream_ases_by_asn(self, asn):
         df = self.as_relationship_df
         upstream_ases = df[(df['relation'] == -1) & (df['as1'] == asn)]
@@ -98,7 +98,7 @@ class ASInfo:
         ]
         return upstream_ases
     
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_customer_ases_by_asn(self, asn):
         df = self.as_relationship_df
         downstream_ases = df[(df['relation'] == -1) & (df['as0'] == asn)]
@@ -107,7 +107,7 @@ class ASInfo:
         ]
         return downstream_ases
     
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_as_info_by_ip(self, ip:str):
         if self.all_df is None:
             self.merge(all=True)
@@ -119,7 +119,7 @@ class ASInfo:
             print("Input IP: {} is not valid".format(ip))
         return result
 
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_as_info_by_prefix(self, prefix:str):
         if self.all_df is None:
             self.merge(all=True)
@@ -135,17 +135,17 @@ class ASInfo:
             print(f"the problematic prefix: {prefix_obj}")
         return result
     
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_as_info_by_asn(self, asn:int):
         if self.all_df is None:
             self.merge(all=True)
         return self.all_df[ self.all_df.asn == asn ]
     
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_prefix_by_asn(self, asn:int):
         return self.prefix_to_asn_df[self.prefix_to_asn_df.asn.map(lambda x: asn in x)]
     
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=50000)
     def get_as_info_by_org_name(self, name:str):
         if self.all_df is None:
             self.merge(all=True)
@@ -229,51 +229,14 @@ class ASInfo:
         return peeringdb_net_df
     
     def __build_as_to_org(self):
-        as_org_info_df = pd.DataFrame(self.__build_as_to_org_helper().values())
-        # drop irrelevant columns
-        as_org_info_df = as_org_info_df.drop(columns=["opaque_id", "org_id"])
-        # convert asn column from str to int
-        as_org_info_df = as_org_info_df.astype({'asn': 'int64'})
-        return as_org_info_df
-
-    def __build_as_to_org_helper(self):
-        # The code below is taken from https://catalog.caida.org in late 2020.
-        # I could not find the code anymore. I introduced some minor modifications. 
-        re_format= re.compile("# format:(.+)")
-        org_info = {}
-        asn_info = {}
-        # Pass in test dataset as filename
         with gzip.open(self.asn_to_org, 'rt') as f:
-            for line in f:
-                m = re_format.search(line)
-                if m:
-                    keys = m.group(1).rstrip().split(",")
-                    keys = keys[0].split("|")
-                    if keys[0] == 'aut':
-                        # Replace all instances of 'aut' with 'asn'
-                        keys[0] = 'asn'
-                        # Replace all instances of 'aut_name' with 'asn_name'
-                        keys[2] = 'asn_name'
-                # skips over comments
-                if len(line) == 0 or line[0] == "#":
-                    continue
-                values = line.rstrip().split("|")
-                info = {}
-
-                for i,key in enumerate(keys):
-                    info[keys[i]] = values[i]
-
-                if "asn" == keys[0]:
-                    org_id = info["org_id"]
-                    if org_id in org_info:
-                        for key in ["org_name","country"]:
-                            info[key] = org_info[org_id][key]
-                    asn_info[values[0]] = info
-                elif "org_id" == keys[0]:
-                    org_info[values[0]] = info
-                else:
-                    print ("unknown type",keys[0],file= sys.stderr)
-        return asn_info
+            raw_asn_to_org_result = [json.loads(jline) for jline in f.read().splitlines()]
+        asn_rows = [row for row in raw_asn_to_org_result if row['type'] == 'ASN']
+        org_rows = [row for row in raw_asn_to_org_result if row['type'] == 'Organization']
+        asn_df = pd.DataFrame(asn_rows)
+        org_df = pd.DataFrame(org_rows)
+        as_to_org_df = asn_df.merge(org_df, on='organizationId')[['asn', 'country', 'name_y']].rename(columns={'name_y': 'org_name'}).astype({'asn': 'int64'})
+        return as_to_org_df
     
     def __build_subnet_tree(self):
         t = SubnetTree()
