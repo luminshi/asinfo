@@ -28,17 +28,20 @@ class ASInfo:
         # so we can always fetch the latest dataset at the runtime.
         
         # The AS relationship (CAIDA) dataset path
+        # Src: https://publicdata.caida.org/datasets/as-relationships
         self.as_relationship_dataset = self.DATASET_PATH + "/caida/" + "20211001.as-rel.txt.bz2"
         
         # The Prefix to ASN  (CAIDA) dataset path
+        # Src: http://data.caida.org/datasets/routing/routeviews-prefix2as/
         self.prefix_to_asn = self.DATASET_PATH + "/caida/" + "routeviews-rv2-20211018-1200.pfx2as.gz"
         
         # The AS to Organization (CAIDA) dataset path
+        # Src: https://publicdata.caida.org/datasets/as-organizations
         self.asn_to_org = self.DATASET_PATH + "/caida/" + "20211001.as-org2info.jsonl.gz"
 
         # The PeeringDB nets dataset path
         # How to download the entire peeringdb dump:
-        # curl "https://www.peeringdb.com/api/net" -o all_some_date.json
+        # `curl "https://www.peeringdb.com/api/net" -o all_some_date.json`
         self.peeringdb_nets = self.DATASET_PATH + "/peeringdb/nets/" + "all_20211019.json"
         
         # Initialize empty df variables
@@ -94,7 +97,7 @@ class ASInfo:
         df = self.as_relationship_df
         upstream_ases = df[(df['relation'] == -1) & (df['as1'] == asn)]
         upstream_ases = upstream_ases.merge(self.as_to_org_df, how='left', left_on='as1', right_on='asn')[
-            ['as0', 'as1', 'relation', 'asn_name', 'source', 'org_name', 'country']
+            ['as0', 'as1', 'relation', 'org_name', 'country']
         ]
         return upstream_ases
     
@@ -103,7 +106,7 @@ class ASInfo:
         df = self.as_relationship_df
         downstream_ases = df[(df['relation'] == -1) & (df['as0'] == asn)]
         downstream_ases = downstream_ases.merge(self.as_to_org_df, how='left', left_on='as1', right_on='asn')[
-            ['as0', 'as1', 'relation', 'asn_name', 'source', 'org_name', 'country']
+            ['as0', 'as1', 'relation', 'org_name', 'country']
         ]
         return downstream_ases
     
@@ -166,11 +169,12 @@ class ASInfo:
                 on='asn', how="inner")
 
     def __merge_peeringdb_net(self, df_to_merge_with):
-        result = df_to_merge_with.merge(
-                self.peeringdb_net_df[['asn', 'website',
-                                       'info_type', 'info_traffic',
-                                       'info_ratio', 'info_scope']],
-                on='asn', how="left")
+        """
+        result = df_to_merge_with.merge(self.peeringdb_net_df[['asn', 'info_type', 'info_traffic',
+                                       'info_ratio', 'info_scope', 'website']], on='asn', how="left")
+        """
+        result = df_to_merge_with.merge(self.peeringdb_net_df[['asn', 'info_type', 'info_traffic',
+                                       'info_ratio', 'info_scope']], on='asn', how="left")
         
         # get ASes with traffic information
         ases_with_traffic_level_info = result[result['info_traffic'].str.len() > 1]
@@ -196,6 +200,13 @@ class ASInfo:
         ases_with_traffic_level_info['bw_high_mbps'] = ases_with_traffic_level_info['bw_high'] * ases_with_traffic_level_info['bw_factor']
         result['bw_low_mbps'] = ases_with_traffic_level_info['bw_low_mbps']
         result['bw_high_mbps'] = ases_with_traffic_level_info['bw_high_mbps']
+        
+        result.bw_low_mbps.fillna(-1, inplace=True)
+        result.bw_high_mbps.fillna(-1, inplace=True)
+        result.bw_low_mbps.replace(r'^\s*$', -1, regex=True, inplace=True)
+        result.bw_high_mbps.replace(r'^\s*$', -1, regex=True, inplace=True)
+        
+        #result.astype({"bw_low_mbps": 'int', "bw_high_mbps": 'int'})
         
         # we can now drop the info_traffic column
         result.drop(columns=['info_traffic'])
@@ -250,11 +261,26 @@ class ASInfo:
         prefix2as_df = pd.read_csv(self.prefix_to_asn, names=['prefix', 'prefix_len', 'asn'],
                            delim_whitespace=True, header=None, compression="gzip")
 
+        """
         # Build filters to find rows with MOAS and as_set
         # A MOAS conflict occurs when a particular prefix appears to originate from more than one AS. 
-        #prefix2as_asn_filter_moas = prefix2as_df['asn'].str.contains("_")
+        prefix2as_asn_filter_moas = prefix2as_df['asn'].str.contains("_")
         # Let's ignore AS set records for now; they are rare events.
-        #prefix2as_asn_filter_as_set = prefix2as_df['asn'].str.contains(",")
+        prefix2as_asn_filter_as_set = prefix2as_df['asn'].str.contains(",")
+        """
+        
+        """
+        Note on Multi-origin ASes (MOASes)
+        (https://www.caida.org/catalog/datasets/routeviews-prefix2as/)
+        The file format changed slightly beginning with the 2010-10-27 prefix-to-AS file.
+        Previously, ASes were listed in sorted order in MOASes (for example, we said "10_20_30" and never "30_10_20").
+        Now, we sort the ASes according to their frequency of appearance as an origin AS in the source BGP table.
+        For example, suppose 10.0.0.0/8 is advertised by the ASes 10, 20, and 30,
+        and suppose 7 RouteViews peers saw AS 10 as the origin AS, 4 saw AS 20 as the origin AS, and 29 saw AS 30 as the origin AS.
+        Then the MOAS recorded in the prefix-to-AS file will be 30_10_20, according to descending frequency of appearance as an origin AS.
+        If there is a tie in frequency, then we sort by lexicographical order. With the new sorting order,
+        users who wish to choose "the best" mapping for simplicity (with full understanding of the caveats) can simply pick the first listed AS.
+        """
 
         # Remove as_set from the prefix2as_df
         prefix2as_df = prefix2as_df[~prefix2as_df['asn'].str.contains(",")]
@@ -263,6 +289,9 @@ class ASInfo:
         prefix2as_df_copy['asn'] = prefix2as_df.asn.str.split("_")
         prefix2as_df = prefix2as_df_copy
         prefix2as_df.asn = prefix2as_df.asn.apply(lambda x: [int(asn) for asn in x])
+        
+        # populate the asn seen by most vantage points.
+        prefix2as_df['asn_single'] = prefix2as_df.apply(lambda row: row.asn[0], axis=1)
                 
         return prefix2as_df
 
